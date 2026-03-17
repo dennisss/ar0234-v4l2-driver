@@ -83,7 +83,7 @@ MODULE_PARM_DESC(trigger_mode,
 
 /* Chip ID */
 #define AR0234_CHIP_ID 0x0A56
-#define AR0234_CHIP_ID_MONO 0x1A56
+#define AR0234_CHIP_ID_MONO 0x0A56
 
 /* Sensor frequencies */
 #define AR0234_FREQ_EXTCLK 24000000
@@ -158,7 +158,7 @@ MODULE_PARM_DESC(trigger_mode,
 #define AR0234_NUM_EMBEDDED_LINES 2
 
 /* RESET GPIO */
-#define AR0234_RESET_DELAY_MIN_US 6200
+#define AR0234_RESET_DELAY_MIN_US 50000
 #define AR0234_RESET_DELAY_RANGE_US 1000
 
 /* Register address size in bits */
@@ -277,7 +277,8 @@ static const struct cci_reg_sequence common_init[] = {
 	{ CCI_REG16(0x30F0), 0x2283 },
 	{ AR0234_REG_AE_LUMA_TARGET, 0x5000 },
 	{ AR0234_REG_TEMPSENS_CTRL, 0x0011 },
-	{ AR0234_REG_SMIA_TEST, 0x1982 },
+	// Keep as the default value which doesn't enable EMBEDDED_DATA or EMBEDDED_STATS_EN
+	// { AR0234_REG_SMIA_TEST, 0x1982 },
 };
 
 /* Recommended manufacturer settings for 45MHz pixel clock */
@@ -292,6 +293,15 @@ static const struct cci_reg_sequence ar0234_1920x1200_config[] = {
 	{ AR0234_REG_X_ADDR_START, 0x0008 },
 	{ AR0234_REG_Y_ADDR_END, 0x04B7 },
 	{ AR0234_REG_X_ADDR_END, 0x0787 },
+	{ AR0234_REG_X_ODD_INC, 0x0001 },
+	{ AR0234_REG_Y_ODD_INC, 0x0001 },
+};
+
+static const struct cci_reg_sequence ar0234_1200x1200_config[] = {
+	{ AR0234_REG_Y_ADDR_START, 0x0008 },
+	{ AR0234_REG_X_ADDR_START, 0x0008 + 360 },
+	{ AR0234_REG_Y_ADDR_END, 0x04B7 },
+	{ AR0234_REG_X_ADDR_END, 0x0008 + 360 + 1200 - 1 },
 	{ AR0234_REG_X_ODD_INC, 0x0001 },
 	{ AR0234_REG_Y_ODD_INC, 0x0001 },
 };
@@ -363,6 +373,17 @@ static const struct ar0234_format ar0234_formats[] = {
 			.height = 1200,
 		},
 		.reg_sequence = AR0234_REG_SEQ(ar0234_1920x1200_config),
+	},
+	{
+		.width = 1200,
+		.height = 1200,
+		.crop = {
+			.left = AR0234_PIXEL_ARRAY_LEFT + 360,
+			.top = AR0234_PIXEL_ARRAY_TOP,
+			.width = 1200,
+			.height = 1200,
+		},
+		.reg_sequence = AR0234_REG_SEQ(ar0234_1200x1200_config),
 	},
 	{
 		.width = 1920,
@@ -508,7 +529,7 @@ static void ar0234_set_default_format(struct ar0234 *ar0234)
 	fmt = &ar0234->fmt;
 	fmt->code = ar0234_get_format_code(ar0234);
 
-	fmt->colorspace = V4L2_COLORSPACE_SRGB;
+	fmt->colorspace = V4L2_COLORSPACE_DEFAULT;
 	fmt->ycbcr_enc = V4L2_MAP_YCBCR_ENC_DEFAULT(fmt->colorspace);
 	fmt->quantization = V4L2_MAP_QUANTIZATION_DEFAULT(true, fmt->colorspace,
 							  fmt->ycbcr_enc);
@@ -753,7 +774,7 @@ static int ar0234_enum_frame_size(struct v4l2_subdev *sd,
 
 static void ar0234_reset_colorspace(struct v4l2_mbus_framefmt *fmt)
 {
-	fmt->colorspace = V4L2_COLORSPACE_SRGB;
+	fmt->colorspace = V4L2_COLORSPACE_DEFAULT;
 	fmt->ycbcr_enc = V4L2_MAP_YCBCR_ENC_DEFAULT(fmt->colorspace);
 	fmt->quantization = V4L2_MAP_QUANTIZATION_DEFAULT(true, fmt->colorspace,
 							  fmt->ycbcr_enc);
@@ -1216,9 +1237,11 @@ static int ar0234_identify_module(struct ar0234 *ar0234)
 		return dev_err_probe(ar0234->dev, ret,
 				     "failed to read chip id\n");
 
+	// From the factory  the mono and rgb variants have the same id so assume
+	// it is the mono variant for now. 
 	if (reg_val == AR0234_CHIP_ID_MONO)
 		ar0234->monochrome = true;
-	else if (reg_val != AR0234_CHIP_ID)
+	else
 		return dev_err_probe(ar0234->dev, -EIO,
 				     "Invalid chip id: 0x%x\n", (u16)reg_val);
 
