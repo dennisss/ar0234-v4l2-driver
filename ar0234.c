@@ -83,7 +83,7 @@ MODULE_PARM_DESC(trigger_mode,
 
 /* Chip ID */
 #define AR0234_CHIP_ID 0x0A56
-#define AR0234_CHIP_ID_MONO 0x1A56
+#define AR0234_CHIP_ID_MONO 0x0A56
 
 /* Sensor frequencies */
 #define AR0234_FREQ_EXTCLK 24000000
@@ -151,14 +151,8 @@ MODULE_PARM_DESC(trigger_mode,
 #define AR0234_PIXEL_ARRAY_WIDTH 1920U
 #define AR0234_PIXEL_ARRAY_HEIGHT 1200U
 
-/* Embedded metadata stream buffer size (padding every 4 bytes) */
-#define AR0234_MD_PADDING_BYTES (AR0234_PIXEL_ARRAY_WIDTH / 4)
-#define AR0234_EMBEDDED_LINE_WIDTH \
-	(AR0234_PIXEL_ARRAY_WIDTH + AR0234_MD_PADDING_BYTES)
-#define AR0234_NUM_EMBEDDED_LINES 2
-
 /* RESET GPIO */
-#define AR0234_RESET_DELAY_MIN_US 6200
+#define AR0234_RESET_DELAY_MIN_US 50000
 #define AR0234_RESET_DELAY_RANGE_US 1000
 
 /* Register address size in bits */
@@ -178,7 +172,6 @@ MODULE_PARM_DESC(trigger_mode,
 
 enum pad_types {
 	IMAGE_PAD,
-	METADATA_PAD,
 	NUM_PADS,
 };
 
@@ -277,7 +270,9 @@ static const struct cci_reg_sequence common_init[] = {
 	{ CCI_REG16(0x30F0), 0x2283 },
 	{ AR0234_REG_AE_LUMA_TARGET, 0x5000 },
 	{ AR0234_REG_TEMPSENS_CTRL, 0x0011 },
-	{ AR0234_REG_SMIA_TEST, 0x1982 },
+	// Keep as the default value which doesn't enable EMBEDDED_DATA or EMBEDDED_STATS_EN
+	{ AR0234_REG_SMIA_TEST, 0x1802 },
+	// { AR0234_REG_SMIA_TEST, 0x1982 },
 };
 
 /* Recommended manufacturer settings for 45MHz pixel clock */
@@ -292,6 +287,15 @@ static const struct cci_reg_sequence ar0234_1920x1200_config[] = {
 	{ AR0234_REG_X_ADDR_START, 0x0008 },
 	{ AR0234_REG_Y_ADDR_END, 0x04B7 },
 	{ AR0234_REG_X_ADDR_END, 0x0787 },
+	{ AR0234_REG_X_ODD_INC, 0x0001 },
+	{ AR0234_REG_Y_ODD_INC, 0x0001 },
+};
+
+static const struct cci_reg_sequence ar0234_1200x1200_config[] = {
+	{ AR0234_REG_Y_ADDR_START, 0x0008 },
+	{ AR0234_REG_X_ADDR_START, 0x0008 + 360 },
+	{ AR0234_REG_Y_ADDR_END, 0x04B7 },
+	{ AR0234_REG_X_ADDR_END, 0x0008 + 360 + 1200 - 1 },
 	{ AR0234_REG_X_ODD_INC, 0x0001 },
 	{ AR0234_REG_Y_ODD_INC, 0x0001 },
 };
@@ -363,6 +367,17 @@ static const struct ar0234_format ar0234_formats[] = {
 			.height = 1200,
 		},
 		.reg_sequence = AR0234_REG_SEQ(ar0234_1920x1200_config),
+	},
+	{
+		.width = 1200,
+		.height = 1200,
+		.crop = {
+			.left = AR0234_PIXEL_ARRAY_LEFT + 360,
+			.top = AR0234_PIXEL_ARRAY_TOP,
+			.width = 1200,
+			.height = 1200,
+		},
+		.reg_sequence = AR0234_REG_SEQ(ar0234_1200x1200_config),
 	},
 	{
 		.width = 1920,
@@ -508,7 +523,7 @@ static void ar0234_set_default_format(struct ar0234 *ar0234)
 	fmt = &ar0234->fmt;
 	fmt->code = ar0234_get_format_code(ar0234);
 
-	fmt->colorspace = V4L2_COLORSPACE_SRGB;
+	fmt->colorspace = V4L2_COLORSPACE_DEFAULT;
 	fmt->ycbcr_enc = V4L2_MAP_YCBCR_ENC_DEFAULT(fmt->colorspace);
 	fmt->quantization = V4L2_MAP_QUANTIZATION_DEFAULT(true, fmt->colorspace,
 							  fmt->ycbcr_enc);
@@ -525,8 +540,6 @@ static int ar0234_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 	struct ar0234 *ar0234 = to_ar0234(sd);
 	struct v4l2_mbus_framefmt *try_fmt_img =
 		v4l2_subdev_state_get_format(fh->state, IMAGE_PAD);
-	struct v4l2_mbus_framefmt *try_fmt_meta =
-		v4l2_subdev_state_get_format(fh->state, METADATA_PAD);
 	struct v4l2_rect *try_crop;
 
 	mutex_lock(&ar0234->mutex);
@@ -536,12 +549,6 @@ static int ar0234_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 	try_fmt_img->height = ar0234_formats[0].height;
 	try_fmt_img->code = ar0234_get_format_code(ar0234);
 	try_fmt_img->field = V4L2_FIELD_NONE;
-
-	/* Initialize try_fmt for the embedded metadata pad */
-	try_fmt_meta->width = AR0234_EMBEDDED_LINE_WIDTH;
-	try_fmt_meta->height = AR0234_NUM_EMBEDDED_LINES;
-	try_fmt_meta->code = MEDIA_BUS_FMT_SENSOR_DATA;
-	try_fmt_meta->field = V4L2_FIELD_NONE;
 
 	/* Initialize try_crop rectangle. */
 	try_crop = v4l2_subdev_state_get_crop(fh->state, IMAGE_PAD);
@@ -703,17 +710,10 @@ static int ar0234_enum_mbus_code(struct v4l2_subdev *sd,
 	if (code->pad >= NUM_PADS)
 		return -EINVAL;
 
-	if (code->pad == IMAGE_PAD) {
-		if (code->index >= AR0234_FMT_CODE_AMOUNT)
-			return -EINVAL;
+	if (code->index >= AR0234_FMT_CODE_AMOUNT)
+		return -EINVAL;
 
-		code->code = ar0234_get_format_code(ar0234);
-	} else {
-		if (code->index > 0)
-			return -EINVAL;
-
-		code->code = MEDIA_BUS_FMT_SENSOR_DATA;
-	}
+	code->code = ar0234_get_format_code(ar0234);
 
 	return 0;
 }
@@ -727,33 +727,23 @@ static int ar0234_enum_frame_size(struct v4l2_subdev *sd,
 	if (fse->pad >= NUM_PADS)
 		return -EINVAL;
 
-	if (fse->pad == IMAGE_PAD) {
-		if (fse->index >= ARRAY_SIZE(ar0234_formats))
-			return -EINVAL;
+	if (fse->index >= ARRAY_SIZE(ar0234_formats))
+		return -EINVAL;
 
-		if (fse->code != ar0234_get_format_code(ar0234))
-			return -EINVAL;
+	if (fse->code != ar0234_get_format_code(ar0234))
+		return -EINVAL;
 
-		fse->min_width = ar0234_formats[fse->index].width;
-		fse->max_width = fse->min_width;
-		fse->min_height = ar0234_formats[fse->index].height;
-		fse->max_height = fse->min_height;
-	} else {
-		if (fse->code != MEDIA_BUS_FMT_SENSOR_DATA || fse->index > 0)
-			return -EINVAL;
-
-		fse->min_width = AR0234_EMBEDDED_LINE_WIDTH;
-		fse->max_width = fse->min_width;
-		fse->min_height = AR0234_NUM_EMBEDDED_LINES;
-		fse->max_height = fse->min_height;
-	}
+	fse->min_width = ar0234_formats[fse->index].width;
+	fse->max_width = fse->min_width;
+	fse->min_height = ar0234_formats[fse->index].height;
+	fse->max_height = fse->min_height;
 
 	return 0;
 }
 
 static void ar0234_reset_colorspace(struct v4l2_mbus_framefmt *fmt)
 {
-	fmt->colorspace = V4L2_COLORSPACE_SRGB;
+	fmt->colorspace = V4L2_COLORSPACE_DEFAULT;
 	fmt->ycbcr_enc = V4L2_MAP_YCBCR_ENC_DEFAULT(fmt->colorspace);
 	fmt->quantization = V4L2_MAP_QUANTIZATION_DEFAULT(true, fmt->colorspace,
 							  fmt->ycbcr_enc);
@@ -770,14 +760,6 @@ static void ar0234_update_image_pad_format(struct ar0234 *ar0234,
 	ar0234_reset_colorspace(&fmt->format);
 }
 
-static void ar0234_update_metadata_pad_format(struct v4l2_subdev_format *fmt)
-{
-	fmt->format.width = AR0234_EMBEDDED_LINE_WIDTH;
-	fmt->format.height = AR0234_NUM_EMBEDDED_LINES;
-	fmt->format.code = MEDIA_BUS_FMT_SENSOR_DATA;
-	fmt->format.field = V4L2_FIELD_NONE;
-}
-
 static int __ar0234_get_pad_format(struct ar0234 *ar0234,
 				   struct v4l2_subdev_state *sd_state,
 				   struct v4l2_subdev_format *fmt)
@@ -789,18 +771,12 @@ static int __ar0234_get_pad_format(struct ar0234 *ar0234,
 		struct v4l2_mbus_framefmt *try_fmt =
 			v4l2_subdev_state_get_format(sd_state, fmt->pad);
 		/* update the code which could change due to vflip or hflip: */
-		try_fmt->code = fmt->pad == IMAGE_PAD ?
-					ar0234_get_format_code(ar0234) :
-					MEDIA_BUS_FMT_SENSOR_DATA;
+		try_fmt->code = ar0234_get_format_code(ar0234);
 		fmt->format = *try_fmt;
 	} else {
-		if (fmt->pad == IMAGE_PAD) {
-			ar0234_update_image_pad_format(
-				ar0234, ar0234->mode.format, fmt);
-			fmt->format.code = ar0234_get_format_code(ar0234);
-		} else {
-			ar0234_update_metadata_pad_format(fmt);
-		}
+		ar0234_update_image_pad_format(
+			ar0234, ar0234->mode.format, fmt);
+		fmt->format.code = ar0234_get_format_code(ar0234);
 	}
 
 	return 0;
@@ -851,32 +827,21 @@ static int ar0234_set_pad_format(struct v4l2_subdev *sd,
 
 	mutex_lock(&ar0234->mutex);
 
-	if (fmt->pad == IMAGE_PAD) {
-		fmt->format.code = ar0234_get_format_code(ar0234);
+	fmt->format.code = ar0234_get_format_code(ar0234);
 
-		format = v4l2_find_nearest_size(
-			ar0234_formats, ARRAY_SIZE(ar0234_formats), width,
-			height, fmt->format.width, fmt->format.height);
-		ar0234_update_image_pad_format(ar0234, format, fmt);
-		if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
-			framefmt = v4l2_subdev_state_get_format(sd_state,
-								fmt->pad);
-			*framefmt = fmt->format;
-		} else if (ar0234->mode.format != format ||
-			   ar0234->fmt.code != fmt->format.code) {
-			ar0234->fmt = fmt->format;
-			ar0234->mode.format = format;
-			ar0234_set_framing_limits(ar0234);
-		}
-	} else {
-		if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
-			framefmt = v4l2_subdev_state_get_format(sd_state,
-								fmt->pad);
-			*framefmt = fmt->format;
-		} else {
-			/* Only one embedded data mode is supported */
-			ar0234_update_metadata_pad_format(fmt);
-		}
+	format = v4l2_find_nearest_size(
+		ar0234_formats, ARRAY_SIZE(ar0234_formats), width,
+		height, fmt->format.width, fmt->format.height);
+	ar0234_update_image_pad_format(ar0234, format, fmt);
+	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
+		framefmt = v4l2_subdev_state_get_format(sd_state,
+							fmt->pad);
+		*framefmt = fmt->format;
+	} else if (ar0234->mode.format != format ||
+		   ar0234->fmt.code != fmt->format.code) {
+		ar0234->fmt = fmt->format;
+		ar0234->mode.format = format;
+		ar0234_set_framing_limits(ar0234);
 	}
 
 	mutex_unlock(&ar0234->mutex);
@@ -1216,9 +1181,11 @@ static int ar0234_identify_module(struct ar0234 *ar0234)
 		return dev_err_probe(ar0234->dev, ret,
 				     "failed to read chip id\n");
 
+	// From the factory  the mono and rgb variants have the same id so assume
+	// it is the mono variant for now. 
 	if (reg_val == AR0234_CHIP_ID_MONO)
 		ar0234->monochrome = true;
-	else if (reg_val != AR0234_CHIP_ID)
+	else
 		return dev_err_probe(ar0234->dev, -EIO,
 				     "Invalid chip id: 0x%x\n", (u16)reg_val);
 
@@ -1573,7 +1540,6 @@ static int ar0234_probe(struct i2c_client *client)
 
 	/* Initialize source pads */
 	ar0234->pad[IMAGE_PAD].flags = MEDIA_PAD_FL_SOURCE;
-	ar0234->pad[METADATA_PAD].flags = MEDIA_PAD_FL_SOURCE;
 
 	/* Initialize default format */
 	ar0234_set_default_format(ar0234);
